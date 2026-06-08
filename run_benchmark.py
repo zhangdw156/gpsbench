@@ -53,11 +53,13 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import time
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add evaluation directory to path
 sys.path.insert(0, str(Path(__file__).parent / "evaluation"))
@@ -131,6 +133,187 @@ class GPSBenchRunner:
         # For incremental saving
         self._current_output_dir = None
 
+    def _atomic_write_json(self, path: Path, data: Dict[str, Any]):
+        """Write JSON atomically so interruptions never leave a truncated file."""
+        path.parent.mkdir(exist_ok=True, parents=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            json.dump(data, tmp, indent=2)
+            tmp.write("\n")
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+
+    def _task_result_path(self, output_dir: Path, track_name: str, task_file: str) -> Path:
+        task_results_dir = output_dir / "task_results"
+        task_file_name = task_file.replace(".json", "")
+        return task_results_dir / f"{track_name}_{task_file_name}.json"
+
+    def _load_existing_task_results(
+        self,
+        output_dir: Optional[Path],
+        track_name: str,
+        task_file: str,
+        total: int,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Load prior per-sample results for resume, ignoring malformed ids."""
+        if output_dir is None:
+            return {}
+
+        task_result_path = self._task_result_path(output_dir, track_name, task_file)
+        if not task_result_path.exists():
+            return {}
+
+        try:
+            existing_task = json.loads(task_result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"⚠️  Could not read existing checkpoint {task_result_path}: {exc}. Re-evaluating task.")
+            return {}
+
+        results_by_id: Dict[int, Dict[str, Any]] = {}
+        for result in existing_task.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            try:
+                example_id = int(result.get("example_id"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= example_id < total:
+                results_by_id[example_id] = result
+        return results_by_id
+
+    def _result_needs_retry(self, result: Optional[Dict[str, Any]]) -> bool:
+        """Return True for missing/API-failed samples that should be retried.
+
+        Incorrect but valid model answers are intentionally not retried; retrying
+        them would bias benchmark accuracy. Only transport/parser/client failures
+        and empty/missing responses are considered retryable.
+        """
+        if not isinstance(result, dict):
+            return True
+        if result.get("error"):
+            return True
+        if "correct" not in result:
+            return True
+        response = result.get("response")
+        if response is None:
+            return True
+        if isinstance(response, str) and not response.strip():
+            return True
+        return False
+
+    def _build_sample_result(
+        self,
+        idx: int,
+        example: Dict[str, Any],
+        prompt: str,
+        system_prompt: Optional[str],
+        response,
+    ) -> Dict[str, Any]:
+        """Convert an LLMResponse into the persisted per-sample result format."""
+        if response.error:
+            print(f"❌ Error on example {idx}: {response.error}")
+            return {
+                "example_id": idx,
+                "prompt": prompt,
+                "system_prompt": system_prompt,
+                "response": "",
+                "ground_truth": example.get("ground_truth", {}),
+                "error": response.error,
+                "correct": False,
+                "latency_ms": response.latency_ms,
+                "tokens": response.total_tokens,
+            }
+
+        try:
+            is_correct = self.simple_evaluate(response.text, example)
+            result = {
+                "example_id": idx,
+                "prompt": prompt,
+                "system_prompt": system_prompt,
+                "response": response.text,
+                "ground_truth": example.get("ground_truth", {}),
+                "correct": is_correct,
+                "latency_ms": response.latency_ms,
+                "tokens": response.total_tokens,
+            }
+        except Exception as exc:
+            print(f"❌ Evaluation error on example {idx}: {exc}")
+            result = {
+                "example_id": idx,
+                "prompt": prompt,
+                "system_prompt": system_prompt,
+                "response": getattr(response, "text", ""),
+                "ground_truth": example.get("ground_truth", {}),
+                "error": str(exc),
+                "correct": False,
+                "latency_ms": getattr(response, "latency_ms", 0.0),
+                "tokens": getattr(response, "total_tokens", 0),
+            }
+        return result
+
+    def _build_task_result(
+        self,
+        task_info: Dict[str, str],
+        total: int,
+        results_by_id: Dict[int, Dict[str, Any]],
+        status: str,
+        reused_count: int = 0,
+        evaluated_count: int = 0,
+    ) -> Dict[str, Any]:
+        ordered_results = [results_by_id[i] for i in sorted(results_by_id) if 0 <= i < total]
+        correct = sum(1 for result in ordered_results if result.get("correct") is True)
+        accuracy = (correct / total * 100) if total else 0.0
+        retryable = [
+            i for i in range(total)
+            if i not in results_by_id or self._result_needs_retry(results_by_id[i])
+        ]
+        return {
+            "task_name": task_info["name"],
+            "task_file": task_info["file"],
+            "status": status,
+            "total": total,
+            "correct": correct,
+            "accuracy": accuracy,
+            "resume": {
+                "reused": reused_count,
+                "evaluated": evaluated_count,
+                "completed": len(ordered_results),
+                "pending": len(retryable),
+                "retryable_example_ids": retryable,
+            },
+            "results": ordered_results,
+        }
+
+    def _save_task_checkpoint(
+        self,
+        output_dir: Optional[Path],
+        track_name: str,
+        task_info: Dict[str, str],
+        total: int,
+        results_by_id: Dict[int, Dict[str, Any]],
+        status: str,
+        reused_count: int = 0,
+        evaluated_count: int = 0,
+    ):
+        if output_dir is None:
+            return
+        checkpoint = self._build_task_result(
+            task_info=task_info,
+            total=total,
+            results_by_id=results_by_id,
+            status=status,
+            reused_count=reused_count,
+            evaluated_count=evaluated_count,
+        )
+        task_result_path = self._task_result_path(output_dir, track_name, task_info["file"])
+        self._atomic_write_json(task_result_path, checkpoint)
+
     def init_output_dir(self, output_name: Optional[str] = None) -> Path:
         """Initialize the output directory for saving results incrementally.
 
@@ -178,8 +361,7 @@ class GPSBenchRunner:
         task_file_name = task_result.get("task_file", "unknown.json").replace(".json", "")
         task_result_path = task_results_dir / f"{track_name}_{task_file_name}.json"
 
-        with open(task_result_path, 'w') as f:
-            json.dump(task_result, f, indent=2)
+        self._atomic_write_json(task_result_path, task_result)
 
         print(f"   💾 Saved: {task_result_path.name}")
 
@@ -900,9 +1082,10 @@ FINAL ANSWER: [your answer]"""
         use_batch_api: bool = False,
         batch_dir: str = "batch_files",
         use_concurrent: bool = False,
-        max_workers: int = 10
+        max_workers: int = 10,
+        output_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        """Evaluate a single task"""
+        """Evaluate a single task with per-sample checkpoint/resume support."""
 
         # USE TEST SPLIT ONLY - NO FALLBACK
         task_name = task_info["file"].replace('.json', '')
@@ -917,11 +1100,13 @@ FINAL ANSWER: [your answer]"""
             print(f"{'='*80}\n")
             return {
                 "task_name": task_info["name"],
+                "task_file": task_info["file"],
                 "status": "test_split_not_found",
                 "error": f"Test split not found: {task_file}",
                 "accuracy": 0.0,
                 "total": 0,
-                "correct": 0
+                "correct": 0,
+                "results": [],
             }
 
         # Load task data from test split
@@ -932,155 +1117,170 @@ FINAL ANSWER: [your answer]"""
         if max_samples:
             task_data = task_data[:max_samples]
 
+        total = len(task_data)
+        save_dir = output_dir or self._current_output_dir
+        results_by_id = self._load_existing_task_results(
+            save_dir,
+            track_name,
+            task_info["file"],
+            total,
+        )
+        pending_indices = [
+            idx for idx in range(total)
+            if idx not in results_by_id or self._result_needs_retry(results_by_id[idx])
+        ]
+        reused_count = total - len(pending_indices)
+        evaluated_count = 0
+
         print(f"\n{'='*80}")
         print(f"Task: {task_info['name']}")
         print(f"File: {task_info['file']}")
-        print(f"Samples: {len(task_data)}")
+        print(f"Samples: {total}")
+        if save_dir:
+            print(f"Resume: {reused_count} reusable, {len(pending_indices)} pending/error samples")
         if use_concurrent:
             print(f"Mode: Concurrent ({max_workers} workers)")
         print(f"{'='*80}")
 
-        results = []
-        correct = 0
+        if not pending_indices:
+            task_result = self._build_task_result(
+                task_info=task_info,
+                total=total,
+                results_by_id=results_by_id,
+                status="completed",
+                reused_count=reused_count,
+                evaluated_count=0,
+            )
+            self._save_task_checkpoint(
+                save_dir,
+                track_name,
+                task_info,
+                total,
+                results_by_id,
+                status="completed",
+                reused_count=reused_count,
+                evaluated_count=0,
+            )
+            print(f"   ⏭️  Skipped: all {total} samples already have valid responses")
+            return task_result
 
-        # Concurrent processing mode
-        if use_concurrent:
-            # Prepare all prompts
-            prompts = []
-            system_prompts = []
-            for example in task_data:
-                system_prompt, user_prompt = self.create_prompt(example, task_info["name"])
-                prompts.append(user_prompt)
-                system_prompts.append(system_prompt)
-
-            # Check all system prompts are the same
-            if len(set(system_prompts)) > 1:
-                print("Warning: Multiple different system prompts detected, using first one")
-            system_prompt = system_prompts[0] if system_prompts else None
-
-            # Batch generate with concurrent requests
-            print(f"Processing {len(prompts)} requests concurrently (max {max_workers} parallel workers)...")
-            responses = self.llm_client.batch_generate(
-                prompts=prompts,
-                system_prompt=system_prompt,
-                delay=0,  # No delay needed for concurrent requests
-                max_workers=max_workers
+        def persist(status: str):
+            self._save_task_checkpoint(
+                save_dir,
+                track_name,
+                task_info,
+                total,
+                results_by_id,
+                status=status,
+                reused_count=reused_count,
+                evaluated_count=evaluated_count,
             )
 
-            # Evaluate responses
-            for idx, (example, response) in enumerate(tqdm(
-                zip(task_data, responses),
-                total=len(task_data),
-                desc=f"Evaluating {task_info['name']}"
-            )):
-                if response.error:
-                    print(f"❌ Error on example {idx}: {response.error}")
-                    results.append({
-                        "example_id": idx,
-                        "prompt": prompts[idx],
-                        "system_prompt": system_prompt,
-                        "response": "",
-                        "ground_truth": example.get("ground_truth", {}),
-                        "error": response.error,
-                        "correct": False
-                    })
-                    continue
-
-                # Evaluate answer
-                is_correct = self.simple_evaluate(response.text, example)
-
-                if is_correct:
-                    correct += 1
-
-                results.append({
-                    "example_id": idx,
-                    "prompt": prompts[idx],
-                    "system_prompt": system_prompt,
-                    "response": response.text,
-                    "ground_truth": example.get("ground_truth", {}),
-                    "correct": is_correct,
-                    "latency_ms": response.latency_ms,
-                    "tokens": response.total_tokens
-                })
-
-        # Sequential processing mode (original)
-        else:
-            # Process each example
-            for idx, example in enumerate(tqdm(task_data, desc=f"Evaluating {task_info['name']}")):
-                try:
-                    # Create prompt
+        if use_concurrent:
+            print(f"Processing {len(pending_indices)} pending requests concurrently (max {max_workers} parallel workers)...")
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            future_to_meta = {}
+            try:
+                for idx in pending_indices:
+                    example = task_data[idx]
                     system_prompt, user_prompt = self.create_prompt(example, task_info["name"])
+                    future = executor.submit(self.llm_client.generate, user_prompt, system_prompt)
+                    future_to_meta[future] = (idx, example, user_prompt, system_prompt)
 
-                    # Get LLM response
+                with tqdm(total=len(future_to_meta), desc="Processing pending requests") as pbar:
+                    for future in as_completed(future_to_meta):
+                        idx, example, user_prompt, system_prompt = future_to_meta[future]
+                        try:
+                            response = future.result()
+                            result = self._build_sample_result(idx, example, user_prompt, system_prompt, response)
+                        except KeyboardInterrupt:
+                            persist("in_progress")
+                            raise
+                        except Exception as exc:
+                            print(f"❌ Exception on example {idx}: {exc}")
+                            result = {
+                                "example_id": idx,
+                                "prompt": user_prompt,
+                                "system_prompt": system_prompt,
+                                "response": "",
+                                "ground_truth": example.get("ground_truth", {}),
+                                "error": str(exc),
+                                "correct": False,
+                            }
+
+                        results_by_id[idx] = result
+                        evaluated_count += 1
+                        persist("in_progress")
+                        pbar.update(1)
+
+            except KeyboardInterrupt:
+                for future in future_to_meta:
+                    future.cancel()
+                persist("in_progress")
+                raise
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        else:
+            for idx in tqdm(pending_indices, desc=f"Evaluating pending {task_info['name']}"):
+                example = task_data[idx]
+                try:
+                    system_prompt, user_prompt = self.create_prompt(example, task_info["name"])
                     response = self.llm_client.generate(
                         prompt=user_prompt,
-                        system_prompt=system_prompt
+                        system_prompt=system_prompt,
                     )
-
-                    if response.error:
-                        print(f"❌ Error on example {idx}: {response.error}")
-                        results.append({
-                            "example_id": idx,
-                            "prompt": user_prompt,
-                            "system_prompt": system_prompt,
-                            "response": "",
-                            "ground_truth": example.get("ground_truth", {}),
-                            "error": response.error,
-                            "correct": False
-                        })
-                        continue
-
-                    # Extract answer
-                    answer_text = response.text
-
-                    # Simple evaluation (can be enhanced with task-specific evaluators)
-                    is_correct = self.simple_evaluate(answer_text, example)
-
-                    if is_correct:
-                        correct += 1
-
-                    results.append({
-                        "example_id": idx,
-                        "prompt": user_prompt,
-                        "system_prompt": system_prompt,
-                        "response": answer_text,
-                        "ground_truth": example.get("ground_truth", {}),
-                        "correct": is_correct,
-                        "latency_ms": response.latency_ms,
-                        "tokens": response.total_tokens
-                    })
-
-                    # Rate limiting
-                    if delay > 0:
-                        time.sleep(delay)
-
-                except Exception as e:
-                    print(f"❌ Exception on example {idx}: {e}")
-                    # Try to include prompt/ground_truth if available
+                    result = self._build_sample_result(idx, example, user_prompt, system_prompt, response)
+                except KeyboardInterrupt:
+                    persist("in_progress")
+                    raise
+                except Exception as exc:
+                    print(f"❌ Exception on example {idx}: {exc}")
                     result = {
                         "example_id": idx,
-                        "error": str(e),
-                        "correct": False
+                        "error": str(exc),
+                        "correct": False,
                     }
                     try:
                         result["prompt"] = user_prompt
                         result["system_prompt"] = system_prompt
                         result["ground_truth"] = example.get("ground_truth", {})
-                    except:
+                        result["response"] = ""
+                    except Exception:
                         pass
-                    results.append(result)
 
-        # Calculate metrics
-        accuracy = (correct / len(task_data) * 100) if task_data else 0.0
+                results_by_id[idx] = result
+                evaluated_count += 1
+                persist("in_progress")
 
-        return {
-            "task_name": task_info["name"],
-            "task_file": task_info["file"],
-            "total": len(task_data),
-            "correct": correct,
-            "accuracy": accuracy,
-            "results": results
-        }
+                # Rate limiting
+                if delay > 0:
+                    time.sleep(delay)
+
+        final_pending = [
+            idx for idx in range(total)
+            if idx not in results_by_id or self._result_needs_retry(results_by_id[idx])
+        ]
+        final_status = "completed" if not final_pending else "completed_with_errors"
+        task_result = self._build_task_result(
+            task_info=task_info,
+            total=total,
+            results_by_id=results_by_id,
+            status=final_status,
+            reused_count=reused_count,
+            evaluated_count=evaluated_count,
+        )
+        self._save_task_checkpoint(
+            save_dir,
+            track_name,
+            task_info,
+            total,
+            results_by_id,
+            status=final_status,
+            reused_count=reused_count,
+            evaluated_count=evaluated_count,
+        )
+        return task_result
 
     def extract_numbers(self, text: str) -> List[float]:
         """
@@ -1511,7 +1711,8 @@ FINAL ANSWER: [your answer]"""
                 max_samples=max_samples,
                 delay=delay,
                 use_concurrent=use_concurrent,
-                max_workers=max_workers
+                max_workers=max_workers,
+                output_dir=save_dir
             )
             task_results.append(task_result)
             total_correct += task_result.get("correct", 0)
@@ -1990,8 +2191,7 @@ FINAL ANSWER: [your answer]"""
                 })
 
         summary_path = output_dir / "summary.json"
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+        self._atomic_write_json(summary_path, summary)
 
         # 2. Save each track's results
         for track_name, track_data in results.get("tracks", {}).items():
@@ -2015,8 +2215,7 @@ FINAL ANSWER: [your answer]"""
 
                 # Save full task results to separate file
                 task_result_path = task_results_dir / f"{track_name}_{task_file_name}.json"
-                with open(task_result_path, 'w') as f:
-                    json.dump(task, f, indent=2)
+                self._atomic_write_json(task_result_path, task)
 
                 # Add reference to track file
                 track_info["tasks"].append({
@@ -2028,8 +2227,7 @@ FINAL ANSWER: [your answer]"""
                     "results_file": f"task_results/{track_name}_{task_file_name}.json"
                 })
 
-            with open(track_path, 'w') as f:
-                json.dump(track_info, f, indent=2)
+            self._atomic_write_json(track_path, track_info)
 
         # 4. Create README with summary
         readme_content = f"""# GPSBench Evaluation Results
@@ -2127,8 +2325,7 @@ FINAL ANSWER: [your answer]"""
 
                 # Save full task results (overwrite existing)
                 task_result_path = task_results_dir / f"{track_name}_{task_file_name}.json"
-                with open(task_result_path, 'w') as f:
-                    json.dump(task, f, indent=2)
+                self._atomic_write_json(task_result_path, task)
 
                 updated_files.append(task_result_path.name)
 

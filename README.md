@@ -80,3 +80,9 @@ uv run python run_benchmark.py \
 ```
 
 Results are written under `results/`, which is ignored by git.
+
+## Resume interrupted evaluations
+
+The evaluation runner checkpoints each sample into the current output folder as soon as that sample finishes. Re-running with the same `--output` value resumes from `task_results/`: samples with valid responses are reused, while missing samples and samples with an `error` field are evaluated again. Incorrect but valid model answers are not retried, so benchmark accuracy is not biased by repeated attempts.
+
+The provided full-evaluation script uses a stable output folder by default (`<model>_10pct_test`), so restarting the same command will continue unfinished or API-failed samples instead of re-evaluating completed ones.
