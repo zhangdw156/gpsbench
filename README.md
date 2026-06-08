@@ -53,6 +53,8 @@ Use the model id exposed by:
 curl -s "$OPENAI_BASE_URL/models"
 ```
 
+By default, the runner also reads this `/v1/models` metadata to set the output cap to half of the served model's context length (for example, `max_model_len: 131072` -> `--max-tokens 65536`). If the endpoint does not expose a recognizable context field, the runner falls back to `8192`. Override explicitly with `--max-tokens N` or `MAX_TOKENS=N bash scripts/run_full_10pct_evaluation.sh`.
+
 Run a smoke test:
 
 ```bash

@@ -6,6 +6,7 @@ Supports OpenAI API, OpenRouter API, and Google Gemini API
 import os
 import time
 import threading
+import re
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +30,31 @@ GEMINI_RATE_LIMITS = {
     "gemini-3-flash-preview": {"rpm": 2000, "tpm": 4_000_000},
     # Default for unknown models (conservative)
     "default": {"rpm": 100, "tpm": 1_000_000},
+}
+
+
+DEFAULT_MAX_TOKENS_FALLBACK = 8192
+
+
+# Field names seen in OpenAI-compatible /v1/models responses across vLLM,
+# OpenRouter, and other local inference servers. Do not include generic
+# fields such as "max_tokens" here because those may describe output caps or
+# pricing metadata rather than the model's total context window.
+CONTEXT_LENGTH_KEYS = {
+    "max_model_len",
+    "context_length",
+    "context_window",
+    "context_size",
+    "max_context_length",
+    "max_context_len",
+    "max_sequence_length",
+    "max_seq_length",
+    "max_seq_len",
+    "model_max_length",
+    "max_position_embeddings",
+    "n_ctx",
+    "token_limit",
+    "input_token_limit",
 }
 
 
@@ -175,7 +201,7 @@ class LLMClient:
         provider: str = "auto",
         model: str = "gpt-4",
         temperature: float = 0.0,
-        max_tokens: int = 1000,
+        max_tokens: Optional[int] = None,
         timeout: int = 30,
         reasoning_effort: str = "medium",
         gemini_rpm: Optional[int] = None,
@@ -188,7 +214,7 @@ class LLMClient:
             provider: 'openai', 'openrouter', or 'auto' (default: auto-detect from model name)
             model: Model name (e.g., 'gpt-4', 'anthropic/claude-3-opus', 'gpt-5.1')
             temperature: Sampling temperature (0.0 = deterministic)
-            max_tokens: Maximum tokens in response
+            max_tokens: Maximum tokens in response. If omitted, defaults to half of the model's context length from /v1/models when available.
             timeout: Request timeout in seconds
             reasoning_effort: For reasoning models, effort level ('none', 'low', 'medium', 'high')
             gemini_rpm: Override RPM (requests per minute) limit for Gemini models
@@ -197,6 +223,8 @@ class LLMClient:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.model_context_length: Optional[int] = None
+        self.max_tokens_source = "explicit" if max_tokens is not None else "unresolved"
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
         self.max_retries = max_retries
@@ -244,6 +272,176 @@ class LLMClient:
 
         else:
             raise ValueError(f"Unknown provider: {provider}")
+
+        if self.max_tokens is None:
+            self.max_tokens = self._resolve_default_max_tokens()
+
+    def _resolve_default_max_tokens(self) -> int:
+        """
+        Resolve the default generation cap.
+
+        For OpenAI-compatible providers, fetch /v1/models and use half of the
+        served model's context length. If the endpoint cannot provide a context
+        length (for example, native Gemini or an OpenAI-compatible server that
+        omits metadata), fall back to the previous safe default.
+        """
+        context_length = self._fetch_model_context_length()
+        if context_length:
+            self.model_context_length = context_length
+            self.max_tokens_source = f"half_context_from_v1_models:{context_length}"
+            return max(1, context_length // 2)
+
+        self.max_tokens_source = f"fallback:{DEFAULT_MAX_TOKENS_FALLBACK}"
+        print(
+            f"[LLMClient] Warning: could not determine context length for "
+            f"{self.model!r} from /v1/models; using max_tokens="
+            f"{DEFAULT_MAX_TOKENS_FALLBACK}. Pass --max-tokens to override."
+        )
+        return DEFAULT_MAX_TOKENS_FALLBACK
+
+    def _fetch_model_context_length(self) -> Optional[int]:
+        """Fetch context length for self.model from an OpenAI-compatible /v1/models endpoint."""
+        if self.provider not in {"openai", "openrouter"}:
+            return None
+
+        try:
+            models_response = self.client.models.list(timeout=self.timeout)
+        except Exception as exc:
+            print(f"[LLMClient] Warning: /v1/models lookup failed: {exc}")
+            return None
+
+        model_cards = self._get_model_cards(models_response)
+        if not model_cards:
+            return None
+
+        selected = self._select_model_card(model_cards)
+        if selected is None:
+            available = [str(card.get("id")) for card in model_cards if card.get("id")]
+            suffix = f" Available model ids: {', '.join(available[:5])}" if available else ""
+            print(f"[LLMClient] Warning: model {self.model!r} not found in /v1/models.{suffix}")
+            return None
+
+        return self._extract_context_length(selected)
+
+    @staticmethod
+    def _get_model_cards(models_response: Any) -> List[Dict[str, Any]]:
+        """Normalize OpenAI SDK or raw-dict model-list responses into dictionaries."""
+        data = None
+        if isinstance(models_response, dict):
+            data = models_response.get("data")
+        else:
+            data = getattr(models_response, "data", None)
+
+        if data is None:
+            return []
+
+        return [LLMClient._model_card_to_dict(card) for card in list(data)]
+
+    @staticmethod
+    def _model_card_to_dict(card: Any) -> Dict[str, Any]:
+        """Convert SDK model objects, SimpleNamespace test doubles, or dicts to a dict."""
+        if isinstance(card, dict):
+            return card
+
+        if hasattr(card, "model_dump"):
+            try:
+                dumped = card.model_dump()
+                if isinstance(dumped, dict):
+                    model_extra = getattr(card, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        dumped.update(model_extra)
+                    return dumped
+            except Exception:
+                pass
+
+        if hasattr(card, "dict"):
+            try:
+                dumped = card.dict()
+                if isinstance(dumped, dict):
+                    model_extra = getattr(card, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        dumped.update(model_extra)
+                    return dumped
+            except Exception:
+                pass
+
+        result: Dict[str, Any] = {}
+        for key in ("id", *CONTEXT_LENGTH_KEYS, "metadata", "limits", "top_provider"):
+            if hasattr(card, key):
+                result[key] = getattr(card, key)
+
+        model_extra = getattr(card, "model_extra", None)
+        if isinstance(model_extra, dict):
+            result.update(model_extra)
+
+        return result
+
+    def _select_model_card(self, model_cards: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Select the requested model card, falling back to the sole served model."""
+        for card in model_cards:
+            if str(card.get("id", "")) == self.model:
+                return card
+
+        model_lower = self.model.lower()
+        for card in model_cards:
+            if str(card.get("id", "")).lower() == model_lower:
+                return card
+
+        if len(model_cards) == 1:
+            only = model_cards[0]
+            print(
+                f"[LLMClient] Warning: model {self.model!r} was not an exact /v1/models "
+                f"match; using the only served model {only.get('id')!r} for context length."
+            )
+            return only
+
+        return None
+
+    @classmethod
+    def _extract_context_length(cls, value: Any) -> Optional[int]:
+        """Recursively extract a positive context length from known metadata keys."""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if cls._normalize_context_key(key) in CONTEXT_LENGTH_KEYS:
+                    parsed = cls._parse_positive_int(item)
+                    if parsed:
+                        return parsed
+
+            for item in value.values():
+                parsed = cls._extract_context_length(item)
+                if parsed:
+                    return parsed
+
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                parsed = cls._extract_context_length(item)
+                if parsed:
+                    return parsed
+
+        return None
+
+    @staticmethod
+    def _normalize_context_key(key: Any) -> str:
+        """Normalize metadata keys such as maxModelLen to max_model_len."""
+        key_str = str(key)
+        key_str = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key_str)
+        return key_str.replace("-", "_").lower()
+
+    @staticmethod
+    def _parse_positive_int(value: Any) -> Optional[int]:
+        """Parse positive integer-ish context length values."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, float):
+            return int(value) if value > 0 else None
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "").replace("_", "")
+            if cleaned.isdigit():
+                parsed = int(cleaned)
+                return parsed if parsed > 0 else None
+        return None
 
     def _is_reasoning_model(self, model: str) -> bool:
         """
@@ -651,7 +849,8 @@ class LLMClient:
                         "input": full_input,
                         "reasoning": {
                             "effort": self.reasoning_effort
-                        }
+                        },
+                        "max_output_tokens": max_tok
                     }
                 }
                 tasks.append(task)
@@ -1235,7 +1434,8 @@ class LLMClient:
                         "input": full_input,
                         "reasoning": {
                             "effort": self.reasoning_effort
-                        }
+                        },
+                        "max_output_tokens": max_tok
                     }
                 }
                 tasks.append(task)

@@ -2376,6 +2376,12 @@ def main():
         help='Sampling temperature (default: 0.0 for deterministic)'
     )
     parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=None,
+        help='Maximum output tokens. Default: half of the model context length reported by /v1/models; falls back to 8192 if unavailable.'
+    )
+    parser.add_argument(
         '--reasoning-effort',
         type=str,
         choices=['low', 'medium', 'high'],
@@ -2495,6 +2501,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive")
+
     # Handle --use-batch flag (shortcut for --batch-mode auto)
     if args.use_batch:
         args.batch_mode = 'auto'
@@ -2516,10 +2525,11 @@ def main():
         provider=args.provider,
         model=args.model,
         temperature=args.temperature,
-        max_tokens=8192,  # Increased for complex tasks - consistent across OpenAI/Gemini
+        max_tokens=args.max_tokens,
         timeout=120,  # Increased timeout for complex calculations (Area/Route tasks)
         reasoning_effort=args.reasoning_effort  # For reasoning models (gpt-5.x)
     )
+    print(f"Max output tokens: {llm_client.max_tokens} ({llm_client.max_tokens_source})")
 
     # Validate batch mode compatibility
     if args.batch_mode != 'none' and llm_client.provider not in ("openai", "gemini"):

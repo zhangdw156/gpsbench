@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Full evaluation on the constructed 10% GPSBench test split.
 # Expected data layout: data/track_*/splits/*_test.json
-# Override defaults with env vars, e.g. MODEL=qwen3-4b-thinking-2507 MAX_WORKERS=8 bash scripts/run_full_10pct_evaluation.sh
+# Override defaults with env vars, e.g. MODEL=qwen3-4b-thinking-2507 MAX_WORKERS=8 MAX_TOKENS=65536 bash scripts/run_full_10pct_evaluation.sh
 
 MODEL=${MODEL:-qwen3-4b-thinking-2507}
 PROVIDER=${PROVIDER:-openai}
@@ -29,6 +29,11 @@ if [[ -n "${TASKS:-}" ]]; then
   task_args+=(--tasks $TASKS)
 fi
 
+max_token_args=()
+if [[ -n "${MAX_TOKENS:-}" ]]; then
+  max_token_args+=(--max-tokens "$MAX_TOKENS")
+fi
+
 export OPENAI_BASE_URL OPENAI_API_KEY
 
 uv run python run_benchmark.py \
@@ -37,6 +42,7 @@ uv run python run_benchmark.py \
   --track "$TRACK" \
   "${task_args[@]}" \
   "${sample_args[@]}" \
+  "${max_token_args[@]}" \
   --concurrent \
   --max-workers "$MAX_WORKERS" \
   --delay "$DELAY" \
