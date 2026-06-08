@@ -17,7 +17,7 @@ Optional env:
   HF_MAX_WORKERS        Download workers for hf download (default: 8)
   FORCE_DOWNLOAD        Set to 1 to force redownload
   DRY_RUN               Set to 1 to print the download plan without writing files
-  HF_USE_ENV_TOKEN      Set to 1 to force using HF_TOKEN from the environment
+  HF_CLI                Command used to run hf. Default: "uvx hf"
 
 Examples:
   bash scripts/prepare_data.sh
@@ -36,11 +36,8 @@ DATA_INCLUDE=${DATA_INCLUDE:-data/**}
 LOCAL_DIR=${LOCAL_DIR:-.}
 HF_MAX_WORKERS=${HF_MAX_WORKERS:-8}
 
-hf_cmd=(uvx hf)
-if [[ -n "${HF_TOKEN:-}" && "${HF_USE_ENV_TOKEN:-0}" != "1" ]]; then
-  echo "note: HF_TOKEN is set; ignoring it so the stored 'hf auth login' token is used. Set HF_USE_ENV_TOKEN=1 to force HF_TOKEN." >&2
-  hf_cmd=(env -u HF_TOKEN uvx hf)
-fi
+HF_CLI_STRING="${HF_CLI:-uvx hf}"
+read -r -a HF_CMD <<< "$HF_CLI_STRING"
 
 extra_args=()
 if [[ "${FORCE_DOWNLOAD:-0}" == "1" || "${FORCE_DOWNLOAD:-}" == "true" ]]; then
@@ -51,7 +48,7 @@ if [[ "${DRY_RUN:-0}" == "1" || "${DRY_RUN:-}" == "true" ]]; then
 fi
 
 echo "download data: hf://datasets/$DATA_REPO ($DATA_INCLUDE) -> $LOCAL_DIR"
-"${hf_cmd[@]}" download "$DATA_REPO" \
+"${HF_CMD[@]}" download "$DATA_REPO" \
   --repo-type dataset \
   --include "$DATA_INCLUDE" \
   --local-dir "$LOCAL_DIR" \
