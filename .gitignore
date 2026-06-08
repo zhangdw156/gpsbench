@@ -1,0 +1,29 @@
+# Secrets / local env
+.env
+.env.local
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local benchmark/runtime data
+/data/
+/results/
+/batch_files/
+/.omx/
+*.jsonl
+*.csv
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
