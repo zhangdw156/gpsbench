@@ -21,18 +21,18 @@ uv sync
 
 This creates `.venv/` from `pyproject.toml` and the committed `uv.lock`. Run project commands through `uv run ...` or activate the environment with `source .venv/bin/activate`.
 
-## Download GPSBench-10pct data
+## Prepare evaluation data
 
-Download only the benchmark `data/` tree into the project root:
+Download the constructed 10% GPSBench evaluation split from Hugging Face into the project root. Use `uvx hf` so the download command works even before the project environment is activated:
 
 ```bash
-uv run hf download zhangdw/GPSBench-10pct \
+uvx hf download zhangdw/GPSBench-10pct \
   --type dataset \
   --include 'data/**' \
   --local-dir .
 ```
 
-After download, the runner uses the normal default paths:
+This downloads only the benchmark `data/` tree. After download, the runner uses the normal default paths:
 
 ```text
 data/track_pure_gps/splits/*_test.json
