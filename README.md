@@ -23,16 +23,15 @@ This creates `.venv/` from `pyproject.toml` and the committed `uv.lock`. Run pro
 
 ## Prepare evaluation data
 
-Download the constructed 10% GPSBench evaluation split from Hugging Face into the project root. Use `uvx hf` so the download command works even before the project environment is activated:
+Download the constructed 10% GPSBench evaluation split from Hugging Face into the project root:
 
 ```bash
-uvx hf download zhangdw/GPSBench-10pct \
-  --type dataset \
-  --include 'data/**' \
-  --local-dir .
+bash scripts/prepare_data.sh
 ```
 
-This downloads only the benchmark `data/` tree. After download, the runner uses the normal default paths:
+The script downloads only the benchmark `data/` tree from `zhangdw/GPSBench-10pct` using `uvx hf`, then checks that both track test splits exist. For a no-write preview, run `DRY_RUN=1 bash scripts/prepare_data.sh`.
+
+After download, the runner uses the normal default paths:
 
 ```text
 data/track_pure_gps/splits/*_test.json
