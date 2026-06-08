@@ -1,0 +1,16 @@
+[project]
+name = "gpsbench-eval"
+version = "0.1.0"
+description = "Minimal GPSBench evaluation harness for OpenAI-compatible and Gemini model endpoints."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-genai>=1.0.0",
+    "huggingface-hub>=0.23.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+]
+
+[tool.uv]
+package = false

@@ -7,22 +7,26 @@ This fork is trimmed to the code needed to evaluate GPSBench-style test splits w
 - `run_benchmark.py` — main evaluation runner
 - `evaluation/llm_client.py` — OpenAI/OpenRouter/Gemini-compatible client wrapper
 - `prompts/` — task prompt templates
-- `.env.example` / `requirements.txt` — minimal runtime setup
+- `.env.example` / `pyproject.toml` / `uv.lock` — reproducible uv-managed runtime setup
 
 Generated data and results are intentionally not versioned.
 
 ## Setup
 
+Install the uv-managed environment after cloning:
+
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+This creates `.venv/` from `pyproject.toml` and the committed `uv.lock`. Run project commands through `uv run ...` or activate the environment with `source .venv/bin/activate`.
 
 ## Download GPSBench-10pct data
 
 Download only the benchmark `data/` tree into the project root:
 
 ```bash
-hf download zhangdw/GPSBench-10pct \
+uv run hf download zhangdw/GPSBench-10pct \
   --type dataset \
   --include 'data/**' \
   --local-dir .
@@ -53,7 +57,7 @@ curl -s "$OPENAI_BASE_URL/models"
 Run a smoke test:
 
 ```bash
-python run_benchmark.py \
+uv run python run_benchmark.py \
   --provider openai \
   --model my-vllm-model \
   --track pure_gps \
@@ -67,7 +71,7 @@ python run_benchmark.py \
 Run the full 10% test set:
 
 ```bash
-python run_benchmark.py \
+uv run python run_benchmark.py \
   --provider openai \
   --model my-vllm-model \
   --track both \
