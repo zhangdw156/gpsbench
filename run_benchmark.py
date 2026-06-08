@@ -1114,16 +1114,23 @@ FINAL ANSWER: [your answer]"""
 
         This is a basic evaluator. For production, use task-specific evaluators.
         """
-        # Extract FINAL ANSWER
+        # Strip hidden reasoning before evaluation for thinking models.
+        # Some OpenAI-compatible servers return visible <think>...</think> text;
+        # only content after the final closing tag should be eligible for scoring.
+        response_for_eval = response
+        think_close = response_for_eval.lower().rfind('</think>')
+        if think_close != -1:
+            response_for_eval = response_for_eval[think_close + len('</think>'):].strip()
+
+        # Extract the last FINAL ANSWER, since reasoning traces can contain earlier drafts.
         final_answer = None
-        for line in response.split('\n'):
+        for line in response_for_eval.split('\n'):
             if 'FINAL ANSWER:' in line.upper():
                 final_answer = line.split(':', 1)[1].strip()
-                break
 
         if not final_answer:
             # Fallback: try to extract answer from end of response
-            lines = response.strip().split('\n')
+            lines = response_for_eval.strip().split('\n')
             # Check last few lines for an answer
             for line in reversed(lines[-10:]):
                 line = line.strip()
@@ -1136,7 +1143,7 @@ FINAL ANSWER: [your answer]"""
 
         if not final_answer:
             # Last resort: use full response
-            final_answer = response.strip()
+            final_answer = response_for_eval.strip()
 
         # Get ground truth
         ground_truth = example.get("ground_truth", {})
